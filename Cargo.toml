@@ -1,0 +1,45 @@
+[package]
+name = "warpd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Native Rust WARP client: kernel WireGuard via netlink + loopback SOCKS5 with SO_MARK policy routing"
+license = "MIT"
+repository = "https://github.com/yangshu114514/warpd"
+keywords = ["wireguard", "warp", "cloudflare", "socks5", "netlink"]
+categories = ["network-programming", "command-line-utilities"]
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+# netlink: 创建 wireguard 接口
+# rtnetlink 0.23 提供类型化 LinkWireguard builder，并统一 netlink-packet-* 版本
+rtnetlink = "0.23"
+# netlink: 配置 wireguard peer
+nl-wireguard = "0.3"
+futures-util = "0.3"
+# socket: SO_MARK
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+# CLI / config / logging
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+# WARP 注册 (HTTPS, 纯 Rust TLS)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+rand = "0.8"
+hex = "0.4"
+# x25519 生成 WG 私钥/公钥
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

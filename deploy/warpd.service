@@ -1,0 +1,120 @@
+# warpd.service —— Cloudflare WARP 客户端守护进程
+#
+# 安装：sudo install -m0644 deploy/warpd.service /etc/systemd/system/warpd.service
+#       sudo systemctl daemon-reload && sudo systemctl enable --now warpd
+#
+# 或直接跑 deploy/install.sh，它会连二进制和权限一起装好。
+
+[Unit]
+Description=warpd - native WARP client (kernel WireGuard via netlink + loopback SOCKS5)
+Documentation=file:/usr/local/share/doc/warpd/README.md
+# 隧道自身的加密 UDP 包要走真实网络出 eth0，所以需要网络已就绪。
+# 用 network-online.target 而不是 network.target：后者只表示网络管理栈起来了，
+# 不保证接口已配置、路由已就绪；warpd 在启动早期就要解析 WARP endpoint。
+Wants=network-online.target
+After=network-online.target
+# 必须在内核 wireguard 模块可用之后再启动（模块由 /etc/modules-load.d/wireguard.conf
+# 或 install.sh 预加载；warpd 预检在非 root 下无法自己 modprobe）。
+After=systemd-modules-load.service
+
+# 崩溃重启限速（systemd 231+ 要求写在 [Unit] 段，写在 [Service] 会被忽略并告警）。
+# 极端情况下（例如 Cloudflare 429 限流、endpoint 不可达）能防止疯狂重启刷屏。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# 关键参数一起写死在这里，避免 unit 与命令行行为不一致。
+# --state 必须显式给：进程以非 root 用户运行，store::default_path() 会退到
+# $HOME/.config/warpd/warp.json，那样每次换用户就重新注册一次（还容易撞 429 限流）。
+ExecStart=/usr/local/bin/warpd \
+    --state /var/lib/warpd/warp.json \
+    --socks 127.0.0.1:1080 \
+    --mark 0x1 \
+    --table 100 \
+    --iface warp0 \
+    --mtu 1280 \
+    --mode consumer
+
+# ── 为什么需要 AmbientCapabilities ────────────────────────────────────────────
+# warpd 以非 root 用户（DynamicUser/User=warpd）运行，但仍要做两类特权操作：
+#   1. netlink 建/配/删内核 WireGuard 接口、加地址、改 MTU、加 rule/route
+#      → 需要 CAP_NET_ADMIN
+#   2. 给 SOCKS5 出站 socket 和 marked DNS 的 socket 设 SO_MARK
+#      → 内核 sock_setsockopt(SO_MARK) 要求 CAP_NET_ADMIN；
+#         warpd 的预检（src/preflight.rs）从 /proc/self/status 的 CapEff 里
+#         同时检查 CAP_NET_ADMIN 和 CAP_NET_RAW，两个都得在
+# 单纯给 CapabilityBoundingSet 是不够的：它只限定「能力上限」，
+# 而进程不是 root、二进制也没有 file capability，exec 时 permitted 集合是空的，
+# 结果一个能用能力都没有 → 启动就报 "insufficient privileges"。
+# AmbientCapabilities 会把指定的能力放进 ambient 集合，使它们跨 exec 保留到
+# warpd 进程里（不需要 setuid root，也不需要 root 运行守护进程）。
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+# 能力上限也收窄到这两个，防止后续被利用提权到别的 capability。
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# ── 为什么 KillSignal 必须是 SIGTERM ──────────────────────────────────────────
+# warpd 的清理逻辑（src/main.rs 的 shutdown_signal + CleanupCtx::cleanup）只挂在
+# SIGTERM 和 SIGINT 上：收到信号后按 fwmark rule/table 100 路由 → 内核接口 warp0
+# 的顺序删除自己创建的东西。
+# systemd 默认就是 SIGTERM，这里显式写出来防被改。
+# 若改成 SIGKILL（或 SIGQUIT 等未被处理的信号），进程立刻消失、清理代码根本不执行，
+# 系统里会永久残留：warp0 接口、fwmark 0x1 → table 100 的 rule、table 100 的 default 路由。
+# 残留后果：所有带 mark 0x1 的流量被黑洞掉（指向一个没人在用的隧道），
+# 下次启动还要靠 delete_if_exists 的兜底去擦屁股。
+KillSignal=SIGTERM
+# 清理要走两次 netlink（删 rule/route、再开新连接删接口），并等内核回收接口；
+# 15s 足够，但别缩短到 5s 以下——超时后 systemd 会补一刀 SIGKILL，就白清理了。
+TimeoutStopSec=15
+
+# 非 0 退出才重启（注册失败、绑定失败、预检失败都会非 0 退出）。
+# 兜底清理：正常 STOP 由 warpd 自己完成（KillSignal=SIGTERM 触发）。
+# 但 SIGKILL / OOM / panic=abort 都会跳过清理，留下 warp0 + fwmark 规则 +
+# table 100 路由。残留的 rule 会把所有带该 mark 的流量导入死隧道，必须清掉。
+# ExecStopPost 在服务的任何终止方式之后都会执行，保证内核状态最终干净。
+ExecStopPost=/usr/local/bin/warpd --cleanup-only --iface warp0 --mark 0x1 --table 100
+
+Restart=on-failure
+RestartSec=3
+
+# 以专用非 root 用户运行，特权收敛到 AmbientCapabilities 指定的两个 capability。
+User=warpd
+Group=warpd
+# 自动创建并 chown /var/lib/warpd，state 文件（含 WireGuard 私钥，0600）落在里面。
+StateDirectory=warpd
+StateDirectoryMode=0700
+
+# 日志走 journald，不要自己再写文件。
+StandardOutput=journal
+StandardError=journal
+# 打开 debug 排查问题：systemctl edit warpd 加 Environment=RUST_LOG=debug
+Environment=RUST_LOG=info
+
+# ── 轻量加固（不影响上述能力与清理路径）─────────────────────────────────────
+# 与 AmbientCapabilities 同用是安全的：ambient 集合由 systemd 在 exec 前通过
+# capset/prctl 显式设置并跨 execve 保留，不依赖 setuid 位或 file capabilities，
+# 所以 NNP 并不会把它清掉。
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+# /var/lib/warpd 由 StateDirectory 自动给 rw，其余文件系统只读。
+ReadWritePaths=/var/lib/warpd
+# warpd 只做网络配置与代理，不碰内核其他面、不加载模块、不需要 device。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# 必须显式 no：policyrt::set_src_valid_mark() 会写
+# /proc/sys/net/ipv4/conf/all/src_valid_mark = 1（WireGuard + fwmark 策略路由的
+# 标准要求，否则带 mark 的回包会被 rp_filter 当 martian 丢弃）。
+# ProtectKernelTunables=yes 会把 /proc/sys 挂成只读，这一步就会失败（虽不致命，
+# 但会退化成"隧道能建、回包被丢"的诡异状态）。
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

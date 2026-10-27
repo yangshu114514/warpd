@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Local editor / OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local env / secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+/state/
+warp.json
+warp.json.tmp.*
+
+# Local cargo overrides (machine-specific paths)
+/.cargo/
